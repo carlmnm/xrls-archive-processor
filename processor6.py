@@ -59,10 +59,10 @@ USER_AGENT = f"xrls-archive/{VERSAO}"
 IDIOMAS = {
     "por": "Português", "eng": "Inglês", "spa": "Espanhol", "fre": "Francês",
     "ger": "Alemão", "ita": "Italiano", "jpn": "Japonês", "kor": "Coreano",
-    "rus": "Russo", "chi": "Chinês", "und": "Indefinido",
+    "rus": "Russo", "chi": "Chinês", "pob": "Português (Brasil)", "und": "Indefinido",
 }
 ALIAS_IDIOMA = {
-    "pt": "por", "ptbr": "por", "pt-br": "por", "br": "por", "pob": "por", "portuguese": "por",
+    "pt": "por", "ptbr": "pob", "pt-br": "pob", "br": "pob", "portuguese": "por",
     "en": "eng", "english": "eng", "es": "spa", "spanish": "spa", "fr": "fre", "fra": "fre",
     "de": "ger", "deu": "ger", "it": "ita", "ja": "jpn", "ko": "kor", "ru": "rus",
     "zh": "chi", "zho": "chi",
@@ -937,6 +937,10 @@ def planejar_legendas_embutidas(midia: Midia) -> "tuple[list[int], list[int]]":
         return [], []
     extrair = pedir_faixas("Extrair para .srt?", texto, False)
     manter = pedir_faixas("Manter dentro do MP4?", texto, midia.caminho.suffix.lower() == ".mp4")
+    repetidas = sorted(set(extrair) & set(manter))
+    if repetidas:
+        aviso(f"Legenda(s) {', '.join(map(str, repetidas))} em 'extrair' e 'manter': alguns players vão mostrá-la "
+              "duas vezes (o .srt solto é carregado junto com o vídeo).")
     return extrair, manter
 
 
@@ -1107,15 +1111,15 @@ def montar_comando(job: Job, saida: Path) -> "list[str]":
             if a.canais >= 6:
                 cmd += [f"-ac:a:{i}", "6"]
 
-    idiomas = [m.legendas[i].idioma for i in job.manter] + [l.idioma for l in job.externas]
-    if idiomas:
+    faixas = [(m.legendas[i].idioma, m.legendas[i].titulo) for i in job.manter] + [(l.idioma, "") for l in job.externas]
+    if faixas:
         cmd += ["-c:s", "mov_text"]
-        padrao = idiomas.index("por") if "por" in idiomas else 0
-        for n, idioma in enumerate(idiomas):
-            if n >= len(job.manter):
-                cmd += [f"-metadata:s:s:{n}", f"language={idioma}",
-                        f"-metadata:s:s:{n}", f"title={IDIOMAS.get(idioma, idioma.upper())}"]
-            cmd += [f"-disposition:s:{n}", "default" if n == padrao else "0"]
+        padrao = next((n for n, (idioma, _) in enumerate(faixas) if idioma in {"por", "pob"}), 0)
+        for n, (idioma, titulo) in enumerate(faixas):
+            nome = titulo or IDIOMAS.get(idioma, idioma.upper())
+            # O MP4 descarta a tag "title"; o nome visível da faixa vai em "handler_name".
+            cmd += [f"-metadata:s:s:{n}", f"language={idioma}", f"-metadata:s:s:{n}", f"handler_name={nome}",
+                    f"-disposition:s:{n}", "default" if n == padrao else "0"]
 
     cmd += ["-map_metadata", "0", "-map_chapters", "0", "-metadata", f"title={job.titulo_meta}",
             "-movflags", "+faststart", "-f", "mp4", str(saida)]
