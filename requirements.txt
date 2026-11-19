@@ -1,0 +1,2 @@
+# Opcional: certificados SSL atualizados (no Debian: apt install python3-certifi)
+certifi
