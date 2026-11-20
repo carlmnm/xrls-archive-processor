@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.parte
+.venv/
+# Nunca suba vídeos, legendas, capas ou chaves
+*.mkv
+*.mp4
+*.avi
+*.srt
+config.json
+.env

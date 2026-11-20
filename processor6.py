@@ -25,6 +25,7 @@ import math
 import os
 import random
 import re
+import secrets
 import shutil
 import ssl
 import struct
@@ -41,10 +42,11 @@ import webbrowser
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from html import escape
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
-VERSAO = "6.1"
+VERSAO = "6.2"
 DATA_VERSAO = "Novembro 2026"
 
 EXTENSOES_VIDEO = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v", ".webm", ".ts", ".flv", ".mpg", ".mpeg"}
@@ -280,6 +282,7 @@ class Config:
     idioma_busca: str = "pt-br"           # idioma das legendas buscadas online
     buscar_legenda_online: bool = True    # sugere a busca quando o filme ainda não tem legenda em português
     ferramenta_sync: str = "auto"         # auto | nenhum | nome/caminho do alass ou ffsubsync
+    otimizar_streaming: bool = False      # faststart: reescreve o MP4 no fim (mais lento, melhor para streaming HTTP)
 
     @classmethod
     def carregar(cls) -> "tuple[Config, bool]":
@@ -395,43 +398,55 @@ def executar_ffmpeg(cmd: "list[str]", duracao: float, rotulo: str) -> None:
         raise ErroProcessamento("FFmpeg não encontrado. Instale e adicione ao PATH.")
 
     cauda: deque = deque(maxlen=12)
-    inicio = time.monotonic()
-    ultimo_desenho = 0.0
-    velocidade = ""
+    estado = {"tempo": 0.0, "velocidade": ""}
 
-    def desenhar(fracao: Optional[float], tempo_midia: float = 0.0) -> None:
-        decorrido = time.monotonic() - inicio
-        if fracao is None:
-            linha = f"  {rotulo:<14} {pintar('decorrido ' + fmt_tempo(decorrido), CINZA)}"
-        else:
-            eta = decorrido * (1 - fracao) / fracao if fracao > 0.01 else 0
-            extra = f"  {velocidade}" if velocidade else ""
-            restante = f"  resta {fmt_tempo(eta)}" if 0.01 < fracao < 1 else ""
-            linha = f"  {rotulo:<14} {barra(fracao)} {fracao * 100:5.1f}%{pintar(extra + restante, CINZA)}"
-        sys.stdout.write("\r" + linha + "\033[K" if COR else "\r" + linha + "   ")
-        sys.stdout.flush()
-
-    try:
+    def ler() -> None:
         for bruta in proc.stdout:  # type: ignore[union-attr]
             linha = bruta.strip()
             chave, sep, valor = linha.partition("=")
             if sep and (chave in CHAVES_PROGRESSO or chave.startswith("stream_")):
                 if chave == "speed" and valor.strip() not in {"", "N/A"}:
-                    velocidade = valor.strip()
+                    estado["velocidade"] = valor.strip()
                 elif chave in {"out_time_us", "out_time_ms"}:
-                    agora = time.monotonic()
-                    if agora - ultimo_desenho < 0.1:
-                        continue
                     try:
                         tempo = int(valor) / 1_000_000
                     except ValueError:
                         continue
                     if tempo >= 0:
-                        ultimo_desenho = agora
-                        desenhar(min(1.0, tempo / duracao) if duracao > 0 else None, tempo)
+                        estado["tempo"] = tempo
             elif linha:
                 cauda.append(linha)
-        codigo = proc.wait()
+
+    leitor = threading.Thread(target=ler, daemon=True)
+    leitor.start()
+    inicio = time.monotonic()
+    inicio_final: "list[float]" = []
+
+    def escrever(linha: str) -> None:
+        sys.stdout.write("\r" + linha + ("\033[K" if COR else "   "))
+        sys.stdout.flush()
+
+    def desenhar() -> None:
+        decorrido = time.monotonic() - inicio
+        fracao = min(1.0, estado["tempo"] / duracao) if duracao > 0 else None
+        if fracao is None:
+            escrever(f"  {rotulo:<14} {pintar('decorrido ' + fmt_tempo(decorrido), CINZA)}")
+        elif fracao >= 0.995:
+            # O vídeo já foi lido por inteiro; falta gravar o final (e, se ativado, otimizar o MP4).
+            if not inicio_final:
+                inicio_final.append(time.monotonic())
+            espera = fmt_tempo(time.monotonic() - inicio_final[0])
+            escrever(f"  {'Finalizando':<14} {barra(1.0)} 100.0%  {pintar('gravando o arquivo… ' + espera, CINZA)}")
+        else:
+            eta = decorrido * (1 - fracao) / fracao if fracao > 0.01 else 0
+            extra = f"  {estado['velocidade']}" if estado["velocidade"] else ""
+            restante = f"  resta {fmt_tempo(eta)}" if fracao > 0.01 else ""
+            escrever(f"  {rotulo:<14} {barra(fracao)} {fracao * 100:5.1f}%{pintar(extra + restante, CINZA)}")
+
+    try:
+        while proc.poll() is None:
+            desenhar()
+            time.sleep(0.2)
     except KeyboardInterrupt:
         proc.terminate()
         try:
@@ -440,13 +455,14 @@ def executar_ffmpeg(cmd: "list[str]", duracao: float, rotulo: str) -> None:
             proc.kill()
         print()
         raise
+    leitor.join(timeout=2)
 
-    if codigo != 0:
+    if proc.returncode != 0:
         print()
         detalhe = "\n".join(f"    {l}" for l in cauda)
         raise ErroProcessamento(f"O FFmpeg falhou na etapa '{rotulo}'.\n{pintar(detalhe, CINZA)}")
     if duracao > 0:
-        desenhar(1.0)
+        escrever(f"  {rotulo:<14} {barra(1.0)} 100.0%")
     print()
 
 
@@ -599,39 +615,189 @@ class TMDB:
         destino.write_bytes(self._baixar(f"{TMDB_IMG}/original{file_path}"))
 
 
-def gerar_galeria(titulo: str, posters: "list[dict]", destino: Path) -> Path:
-    """Página HTML local com todos os pôsteres numerados, para escolher olhando."""
+MODELO_GALERIA = """<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pôsteres — __TITULO__</title>
+<style>
+  :root { color-scheme: dark; --bg:#0e1116; --card:#171b22; --txt:#e6e9ef; --mut:#8b93a1; --acc:#4fd1c5; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:32px clamp(16px,4vw,48px); background:var(--bg); color:var(--txt);
+         font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  h1 { margin:0 0 4px; font-size:22px; }
+  p { margin:0 0 24px; color:var(--mut); }
+  .grade { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:20px; }
+  figure { position:relative; margin:0; background:var(--card); border-radius:12px; overflow:hidden;
+           transition:transform .15s, box-shadow .15s; }
+  figure:hover { transform:translateY(-4px); box-shadow:0 12px 28px rgba(0,0,0,.5); }
+  body.clicavel figure { cursor:pointer; }
+  figure.escolhido { outline:3px solid var(--acc); }
+  img { display:block; width:100%; aspect-ratio:2/3; object-fit:cover; background:#222; }
+  .n { position:absolute; top:10px; left:10px; min-width:34px; padding:2px 10px; border-radius:999px;
+       background:var(--acc); color:#06201d; font-weight:700; font-size:18px; text-align:center; }
+  figcaption { padding:10px 12px; color:var(--mut); font-size:13px; }
+  #aviso { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:var(--acc); color:#06201d;
+           padding:12px 20px; border-radius:999px; font-weight:600; opacity:0; transition:opacity .2s; pointer-events:none; }
+  #aviso.on { opacity:1; }
+</style></head>
+<body class="__CLASSE__">
+<h1>__TITULO__</h1>
+<p>__DICA__</p>
+<div class="grade">__CARTOES__</div>
+<div id="aviso"></div>
+<script>
+const clicavel = __CLICAVEL__;
+document.querySelectorAll("figure").forEach(function (f) {
+  f.addEventListener("click", async function () {
+    if (!clicavel) return;
+    const n = f.dataset.n;
+    try {
+      const r = await fetch("escolher/" + n, { method: "POST" });
+      if (!r.ok) throw new Error("falhou");
+      document.querySelectorAll("figure").forEach(function (x) { x.classList.remove("escolhido"); });
+      f.classList.add("escolhido");
+      const a = document.getElementById("aviso");
+      a.textContent = "Pôster " + n + " escolhido. Pode voltar ao terminal.";
+      a.classList.add("on");
+    } catch (e) {
+      alert("Não consegui falar com o programa. Digite o número no terminal.");
+    }
+  });
+});
+</script></body></html>
+"""
+
+
+def html_galeria(titulo: str, posters: "list[dict]", clicavel: bool) -> str:
+    """Página com os pôsteres numerados. Se 'clicavel', o clique é enviado ao terminal."""
     cartoes = []
     for i, p in enumerate(posters, 1):
         idioma = p.get("iso_639_1")
         rotulo = "Sem texto" if idioma is None else str(idioma).upper()
         cartoes.append(
-            f'<figure><img loading="lazy" src="{TMDB_IMG}/w342{escape(p["file_path"])}" alt="Pôster {i}">'
+            f'<figure data-n="{i}"><img loading="lazy" src="{TMDB_IMG}/w342{escape(p["file_path"])}" alt="Pôster {i}">'
             f'<span class="n">{i}</span><figcaption>{rotulo} · {p.get("width")}×{p.get("height")}</figcaption></figure>')
-    destino.write_text(f"""<!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pôsteres — {escape(titulo)}</title>
-<style>
-  :root {{ color-scheme: dark; --bg:#0e1116; --card:#171b22; --txt:#e6e9ef; --mut:#8b93a1; --acc:#4fd1c5; }}
-  * {{ box-sizing:border-box; }}
-  body {{ margin:0; padding:32px clamp(16px,4vw,48px); background:var(--bg); color:var(--txt);
-         font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }}
-  h1 {{ margin:0 0 4px; font-size:22px; }}
-  p {{ margin:0 0 24px; color:var(--mut); }}
-  .grade {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:20px; }}
-  figure {{ position:relative; margin:0; background:var(--card); border-radius:12px; overflow:hidden;
-           transition:transform .15s, box-shadow .15s; }}
-  figure:hover {{ transform:translateY(-4px); box-shadow:0 12px 28px rgba(0,0,0,.5); }}
-  img {{ display:block; width:100%; aspect-ratio:2/3; object-fit:cover; background:#222; }}
-  .n {{ position:absolute; top:10px; left:10px; min-width:34px; padding:2px 10px; border-radius:999px;
-       background:var(--acc); color:#06201d; font-weight:700; font-size:18px; text-align:center; }}
-  figcaption {{ padding:10px 12px; color:var(--mut); font-size:13px; }}
-</style></head><body>
-<h1>{escape(titulo)}</h1>
-<p>Volte ao terminal e digite o número do pôster escolhido.</p>
-<div class="grade">{''.join(cartoes)}</div>
-</body></html>""", encoding="utf-8")
+    dica_pagina = ("Clique no pôster escolhido e volte ao terminal." if clicavel
+                   else "Volte ao terminal e digite o número do pôster escolhido.")
+    return (MODELO_GALERIA.replace("__TITULO__", escape(titulo)).replace("__CARTOES__", "".join(cartoes))
+            .replace("__CLASSE__", "clicavel" if clicavel else "").replace("__DICA__", dica_pagina)
+            .replace("__CLICAVEL__", "true" if clicavel else "false"))
+
+
+def gerar_galeria(titulo: str, posters: "list[dict]", destino: Path) -> Path:
+    """Versão em arquivo (sem clique), usada se o servidor local não puder subir."""
+    destino.write_text(html_galeria(titulo, posters, False), encoding="utf-8")
     return destino
+
+
+class ServidorGaleria:
+    """Servidor local mínimo (só 127.0.0.1): o clique na galeria chega ao terminal."""
+
+    def __init__(self, titulo: str, posters: "list[dict]") -> None:
+        self.titulo, self.posters = titulo, posters
+        self.token = secrets.token_urlsafe(9)  # impede que outras páginas disparem a escolha
+        self.escolhido = threading.Event()
+        self.numero: Optional[int] = None
+        servidor = self
+
+        class Manipulador(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                pass
+
+            def _responder(self, codigo: int, corpo: str, tipo: str = "text/plain; charset=utf-8") -> None:
+                dados = corpo.encode("utf-8")
+                self.send_response(codigo)
+                self.send_header("Content-Type", tipo)
+                self.send_header("Content-Length", str(len(dados)))
+                self.end_headers()
+                self.wfile.write(dados)
+
+            def do_GET(self) -> None:
+                if self.path == f"/{servidor.token}/":
+                    self._responder(200, html_galeria(servidor.titulo, servidor.posters, True), "text/html; charset=utf-8")
+                else:
+                    self._responder(404, "não encontrado")
+
+            def do_POST(self) -> None:
+                prefixo = f"/{servidor.token}/escolher/"
+                numero = self.path[len(prefixo):] if self.path.startswith(prefixo) else ""
+                if numero.isdigit() and 1 <= int(numero) <= len(servidor.posters):
+                    servidor.numero = int(numero)
+                    servidor.escolhido.set()
+                    self._responder(200, "ok")
+                else:
+                    self._responder(400, "inválido")
+
+        self._http = ThreadingHTTPServer(("127.0.0.1", 0), Manipulador)
+        self._thread = threading.Thread(target=self._http.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._http.server_port}/{self.token}/"
+
+    def iniciar(self) -> None:
+        self._thread.start()
+
+    def parar(self) -> None:
+        self._http.shutdown()
+        self._http.server_close()
+
+
+def ler_linha(prompt: str, evento: Optional[threading.Event] = None) -> Optional[str]:
+    """Lê uma linha do teclado; devolve None se 'evento' disparar antes (ex.: clique no navegador)."""
+    if evento is None or not sys.stdin.isatty():
+        return input(prompt)
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    if os.name == "nt":
+        import msvcrt
+        digitado: "list[str]" = []
+        while not evento.is_set():
+            if not msvcrt.kbhit():
+                time.sleep(0.05)
+                continue
+            tecla = msvcrt.getwch()
+            if tecla in ("\r", "\n"):
+                sys.stdout.write("\n")
+                return "".join(digitado)
+            if tecla == "\x03":
+                raise KeyboardInterrupt
+            if tecla in ("\x00", "\xe0"):  # teclas especiais (setas, F1...): descarta o segundo código
+                msvcrt.getwch()
+            elif tecla == "\x08":
+                if digitado:
+                    digitado.pop()
+                    sys.stdout.write("\b \b")
+            else:
+                digitado.append(tecla)
+                sys.stdout.write(tecla)
+            sys.stdout.flush()
+        return None
+    import select
+    while not evento.is_set():
+        if select.select([sys.stdin], [], [], 0.1)[0]:
+            linha = sys.stdin.readline()
+            if linha == "":
+                raise EOFError
+            return linha.rstrip("\n")
+    return None
+
+
+def perguntar_poster(texto: str, padrao: str, servidor: Optional[ServidorGaleria]) -> str:
+    """Como 'perguntar', mas aceita também o clique na galeria aberta no navegador."""
+    if servidor is None:
+        return perguntar(texto, padrao)
+    prompt = f"{pintar('?', CIANO, NEGRITO)} {texto} {pintar('[' + padrao + ']', CINZA)} › "
+    try:
+        resposta = ler_linha(prompt, servidor.escolhido)
+    except ImportError:
+        resposta = input(prompt)
+    if resposta is None:  # clicou no navegador
+        sys.stdout.write("\r\033[K" if COR else "\n")
+        ok(f"Pôster {servidor.numero} escolhido no navegador")
+        escolha = str(servidor.numero)
+        servidor.escolhido.clear()
+        return escolha
+    return resposta.strip() or padrao
 
 
 # =============================================================================
@@ -1076,26 +1242,39 @@ def _menu_posters(sessao: Sessao, filme: dict, cfg: Config) -> "object":
         idioma = p.get("iso_639_1")
         print(f"  {pintar(f'{i:>3}', CIANO, NEGRITO)}  {'sem texto' if idioma is None else idioma:<10}"
               f"{pintar(str(p.get('width')) + '×' + str(p.get('height')), CINZA)}")
+    servidor: Optional[ServidorGaleria] = None
     if cfg.abrir_galeria:
-        galeria = gerar_galeria(nome_filme, posters, sessao.arquivo_temp(".html"))
         try:
-            webbrowser.open(galeria.as_uri())
-            dica("Abri uma galeria no navegador para você escolher olhando.")
+            servidor = ServidorGaleria(nome_filme, posters)
+            servidor.iniciar()
+            url = servidor.url
+        except OSError:
+            servidor = None
+            url = gerar_galeria(nome_filme, posters, sessao.arquivo_temp(".html")).as_uri()
+        try:
+            webbrowser.open(url)
         except Exception:
             pass
-    dica("Enter = 1 · número · v = voltar · l = imagem local · p = pular capa")
-    while True:
-        r = perguntar("Qual pôster?", "1").strip().lower()
-        if r in {"p", "l", "v"}:
-            return {"p": "pular", "l": "local", "v": "voltar"}[r]
-        if r.isdigit() and 1 <= int(r) <= len(posters):
-            destino = sessao.arquivo_temp(".jpg")
-            try:
-                print(pintar("  Baixando pôster…", CINZA))
-                tmdb.baixar_poster(posters[int(r) - 1]["file_path"], destino)
-                return destino
-            except ErroProcessamento as e:
-                aviso(str(e))
+        dica("Abri uma galeria no navegador. Se não abriu, copie este endereço:")
+        dica(url)
+    dica("Clique no pôster no navegador ou digite o número · Enter = 1 · v = voltar · l = imagem local · p = pular"
+         if servidor else "Enter = 1 · número · v = voltar · l = imagem local · p = pular capa")
+    try:
+        while True:
+            r = perguntar_poster("Qual pôster?", "1", servidor).strip().lower()
+            if r in {"p", "l", "v"}:
+                return {"p": "pular", "l": "local", "v": "voltar"}[r]
+            if r.isdigit() and 1 <= int(r) <= len(posters):
+                destino = sessao.arquivo_temp(".jpg")
+                try:
+                    print(pintar("  Baixando pôster…", CINZA))
+                    tmdb.baixar_poster(posters[int(r) - 1]["file_path"], destino)
+                    return destino
+                except ErroProcessamento as e:
+                    aviso(str(e))
+    finally:
+        if servidor:
+            servidor.parar()
 
 
 def escolher_capa(nome: str, sessao: Sessao) -> Optional[Path]:
@@ -1428,7 +1607,7 @@ def resumir(jobs: "list[Job]", sessao: Sessao) -> "list[str]":
 # Execução
 # =============================================================================
 
-def montar_comando(job: Job, saida: Path) -> "list[str]":
+def montar_comando(job: Job, saida: Path, otimizar_streaming: bool = False) -> "list[str]":
     """Monta UM comando ffmpeg que converte, embute legendas e anexa a capa de uma vez."""
     m = job.midia
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-y", "-i", str(m.caminho)]
@@ -1479,8 +1658,10 @@ def montar_comando(job: Job, saida: Path) -> "list[str]":
             cmd += [f"-metadata:s:s:{n}", f"language={idioma}", f"-metadata:s:s:{n}", f"handler_name={nome}",
                     f"-disposition:s:{n}", "default" if n == padrao else "0"]
 
-    cmd += ["-map_metadata", "0", "-map_chapters", "0", "-metadata", f"title={job.titulo_meta}",
-            "-movflags", "+faststart", "-f", "mp4", str(saida)]
+    cmd += ["-map_metadata", "0", "-map_chapters", "0", "-metadata", f"title={job.titulo_meta}"]
+    if otimizar_streaming:
+        cmd += ["-movflags", "+faststart"]
+    cmd += ["-f", "mp4", str(saida)]
     return cmd
 
 
@@ -1516,7 +1697,7 @@ def executar_job(job: Job, sessao: Sessao) -> Resultado:
     try:
         extrair_legendas(job)
         sincronizar_externas(job, sessao)
-        executar_ffmpeg(montar_comando(job, parcial), job.midia.duracao, "Processando")
+        executar_ffmpeg(montar_comando(job, parcial, sessao.cfg.otimizar_streaming), job.midia.duracao, "Processando")
         if not parcial.exists() or parcial.stat().st_size == 0:
             raise ErroProcessamento("O FFmpeg não gerou o arquivo de saída.")
         os.replace(parcial, job.destino)
@@ -1601,6 +1782,8 @@ def configurar(cfg: Config, primeira_vez: bool) -> None:
     escolha = perguntar("Opção", {"mover": "1", "manter": "2", "apagar": "3"}.get(cfg.originais, "1"))
     cfg.originais = {"1": "mover", "2": "manter", "3": "apagar"}.get(escolha, cfg.originais)
     cfg.nome_minusculo = confirmar("Sugerir nomes em minúsculas separados por _ (ex: the_matrix_1999)?", cfg.nome_minusculo)
+    dica("Otimizar para streaming move o índice do MP4 para o início, mas reescreve o arquivo inteiro no fim.")
+    cfg.otimizar_streaming = confirmar("Otimizar o MP4 para streaming (mais lento no final)?", cfg.otimizar_streaming)
     cfg.animacao = confirmar("Mostrar a animação de abertura?", cfg.animacao)
     cfg.salvar()
     ok(f"Configurações salvas em {ARQ_CONFIG}")
