@@ -14,6 +14,7 @@ e adiciona **capa** (pôsteres do TMDB), tudo em uma única passada do FFmpeg.
 
 ### Debian / Ubuntu
 ```bash
+sudo apt install git
 git clone https://github.com/carlmnm/xrls-archive-processor.git
 cd xrls-archive-processor
 ./install-debian.sh
@@ -22,13 +23,14 @@ xrls
 
 ### Windows
 ```powershell
+winget install Git.Git
 winget install Gyan.FFmpeg
 winget install Python.Python.3.12
 git clone https://github.com/carlmnm/xrls-archive-processor.git
 cd xrls-archive-processor
 python processor6.py
 ```
-Feche e reabra o terminal depois de instalar o FFmpeg.
+Feche e reabra o terminal depois de instalar o Git e o FFmpeg.
 
 ## Uso
 
