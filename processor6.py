@@ -10,10 +10,12 @@ Uso:
     python processor6.py                       modo interativo
     python processor6.py filme.mkv outro.avi   processa direto (ou arraste os
                                                arquivos para cima do script)
-    python processor6.py --setup               reconfigura chave do TMDB e preferências
+    python processor6.py --legenda filme.mkv   só baixa a legenda (OpenSubtitles), sincroniza e salva ao lado do vídeo
+    python processor6.py --setup               reconfigura chaves (TMDB, OpenSubtitles) e preferências
 
 Requisitos: Python 3.8+, FFmpeg e FFprobe no PATH.
 Opcional:   pip install certifi  (certificados SSL atualizados)
+            alass ou ffsubsync no PATH  (alinha legendas baixadas ao áudio)
 """
 from __future__ import annotations
 
@@ -25,9 +27,11 @@ import random
 import re
 import shutil
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -40,7 +44,7 @@ from html import escape
 from pathlib import Path
 from typing import Optional
 
-VERSAO = "6.0"
+VERSAO = "6.1"
 DATA_VERSAO = "Novembro 2026"
 
 EXTENSOES_VIDEO = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v", ".webm", ".ts", ".flv", ".mpg", ".mpeg"}
@@ -54,7 +58,8 @@ CODECS_LEGENDA_TEXTO = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "te
 
 TMDB_API = "https://api.themoviedb.org/3"
 TMDB_IMG = "https://image.tmdb.org/t/p"
-USER_AGENT = f"xrls-archive/{VERSAO}"
+OS_API = "https://api.opensubtitles.com/api/v1"
+USER_AGENT = f"XRLS v{VERSAO}"
 
 IDIOMAS = {
     "por": "Português", "eng": "Inglês", "spa": "Espanhol", "fre": "Francês",
@@ -62,7 +67,7 @@ IDIOMAS = {
     "rus": "Russo", "chi": "Chinês", "pob": "Português (Brasil)", "und": "Indefinido",
 }
 ALIAS_IDIOMA = {
-    "pt": "por", "ptbr": "pob", "pt-br": "pob", "br": "pob", "portuguese": "por",
+    "pt": "por", "pt-pt": "por", "ptbr": "pob", "pt-br": "pob", "br": "pob", "portuguese": "por",
     "en": "eng", "english": "eng", "es": "spa", "spanish": "spa", "fr": "fre", "fra": "fre",
     "de": "ger", "deu": "ger", "it": "ita", "ja": "jpn", "ko": "kor", "ru": "rus",
     "zh": "chi", "zho": "chi",
@@ -271,6 +276,10 @@ class Config:
     idioma_legenda_padrao: str = "por"
     formato_nome: str = "{titulo}_{ano}"
     nome_minusculo: bool = True           # sugestões em minúsculas e separadas por "_"
+    opensubtitles_api_key: str = ""
+    idioma_busca: str = "pt-br"           # idioma das legendas buscadas online
+    buscar_legenda_online: bool = True    # sugere a busca quando o filme ainda não tem legenda em português
+    ferramenta_sync: str = "auto"         # auto | nenhum | nome/caminho do alass ou ffsubsync
 
     @classmethod
     def carregar(cls) -> "tuple[Config, bool]":
@@ -292,6 +301,10 @@ class Config:
     @property
     def chave_tmdb(self) -> str:
         return (os.environ.get("TMDB_API_KEY") or self.tmdb_api_key).strip()
+
+    @property
+    def chave_opensubtitles(self) -> str:
+        return (os.environ.get("OPENSUBTITLES_API_KEY") or self.opensubtitles_api_key).strip()
 
 
 # =============================================================================
@@ -503,8 +516,14 @@ def detectar_idioma(nome_arquivo: str, padrao: str) -> str:
 
 
 def normalizar_idioma(codigo: str) -> str:
+    """'pt-BR' → 'pob', 'en' → 'eng', 'zh-CN' → 'chi'. Códigos desconhecidos passam como estão."""
     codigo = codigo.strip().lower()
-    return ALIAS_IDIOMA.get(codigo, codigo if len(codigo) == 3 else (codigo or "und"))
+    if codigo in ALIAS_IDIOMA:
+        return ALIAS_IDIOMA[codigo]
+    base = codigo.split("-")[0]
+    if base in ALIAS_IDIOMA:
+        return ALIAS_IDIOMA[base]
+    return codigo if len(codigo) == 3 else (base or "und")
 
 
 # =============================================================================
@@ -616,6 +635,210 @@ def gerar_galeria(titulo: str, posters: "list[dict]", destino: Path) -> Path:
 
 
 # =============================================================================
+# Legendas online (OpenSubtitles) e sincronização com o áudio
+# =============================================================================
+
+def hash_opensubtitles(caminho: Path) -> Optional[str]:
+    """Hash padrão do OpenSubtitles: tamanho + soma de 64 KB do início e 64 KB do fim (64 bits)."""
+    bloco = 65536
+    try:
+        tamanho = caminho.stat().st_size
+        if tamanho < bloco * 2:
+            return None
+        h = tamanho
+        with open(caminho, "rb") as f:
+            for pos in (0, tamanho - bloco):
+                f.seek(pos)
+                dados = f.read(bloco)
+                if len(dados) != bloco:
+                    return None
+                h = (h + sum(struct.unpack("<8192Q", dados))) & 0xFFFFFFFFFFFFFFFF
+    except OSError:
+        return None
+    return f"{h:016x}"
+
+
+@dataclass
+class Candidata:
+    file_id: int
+    release: str
+    idioma: str = ""           # código de 3 letras (pob, eng...) informado pelo OpenSubtitles
+    downloads: int = 0
+    hash_ok: bool = False      # já sincronizada com ESTE arquivo (não precisa sincronizar)
+    confiavel: bool = False
+    surdos: bool = False       # SDH: inclui descrições de sons
+    automatica: bool = False   # tradução automática / por IA
+
+    @property
+    def ordem(self) -> tuple:
+        return (not self.hash_ok, self.automatica, self.surdos, not self.confiavel, -self.downloads)
+
+
+class OpenSubtitles:
+    def __init__(self, chave: str) -> None:
+        self.chave = chave.strip()
+        self.base = OS_API
+        self._ctx = _contexto_ssl()
+
+    def _abrir(self, req: urllib.request.Request) -> bytes:
+        for tentativa in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=25, context=self._ctx) as resp:
+                    return resp.read()
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    raise ErroRede("Chave do OpenSubtitles recusada (confira com --setup).")
+                if e.code == 406:
+                    raise ErroRede("Limite de downloads do OpenSubtitles atingido por hoje.")
+                if e.code == 404:
+                    raise ErroRede("Não encontrado no OpenSubtitles.")
+                if e.code == 429 or e.code >= 500:
+                    try:
+                        espera = float(e.headers.get("Retry-After", 2 * (tentativa + 1)))
+                    except (TypeError, ValueError):
+                        espera = 2.0 * (tentativa + 1)
+                    time.sleep(min(10.0, espera))
+                    continue
+                raise ErroRede(f"OpenSubtitles respondeu {e.code}.")
+            except (urllib.error.URLError, TimeoutError, OSError):
+                time.sleep(1.0 * (tentativa + 1))
+        raise ErroRede("Não consegui falar com o OpenSubtitles (sem conexão ou limite de requisições).")
+
+    def _json(self, caminho: str, params: Optional[dict] = None, corpo: Optional[dict] = None) -> dict:
+        url = f"{self.base}{caminho}"
+        if params:  # a API prefere parâmetros em minúsculas e em ordem alfabética
+            url += "?" + urllib.parse.urlencode(sorted((k.lower(), str(v)) for k, v in params.items()))
+        headers = {"Api-Key": self.chave, "User-Agent": USER_AGENT, "Accept": "application/json"}
+        dados = None
+        if corpo is not None:
+            dados = json.dumps(corpo).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=dados, headers=headers, method="POST" if corpo is not None else "GET")
+        try:
+            return json.loads(self._abrir(req))
+        except ValueError:
+            raise ErroRede("Resposta inválida do OpenSubtitles.")
+
+    def buscar(self, idioma: str, hash_arquivo: Optional[str] = None, tmdb_id: Optional[int] = None,
+               titulo: str = "", ano: Optional[int] = None) -> "list[Candidata]":
+        """Busca por hash do arquivo, por ID do TMDB e (se nada achar) pelo nome."""
+        lista = [x.strip() for x in idioma.split(",") if x.strip()]
+        idioma = ",".join(lista)
+        prefs = [normalizar_idioma(x) for x in lista]
+        vistos: set = set()
+        candidatas: "list[Candidata]" = []
+
+        def consultar(extra: dict) -> None:
+            for item in self._json("/subtitles", {"languages": idioma, **extra}).get("data") or []:
+                atributos = item.get("attributes") or {}
+                arquivos = atributos.get("files") or []
+                if not arquivos or arquivos[0].get("file_id") in vistos:
+                    continue
+                file_id = int(arquivos[0]["file_id"])
+                vistos.add(file_id)
+                candidatas.append(Candidata(
+                    file_id=file_id,
+                    release=str(atributos.get("release") or arquivos[0].get("file_name") or "legenda"),
+                    idioma=normalizar_idioma(str(atributos["language"])) if atributos.get("language") else "",
+                    downloads=int(atributos.get("download_count") or 0),
+                    hash_ok=bool(atributos.get("moviehash_match")),
+                    confiavel=bool(atributos.get("from_trusted")),
+                    surdos=bool(atributos.get("hearing_impaired")),
+                    automatica=bool(atributos.get("ai_translated") or atributos.get("machine_translated"))))
+
+        if hash_arquivo:
+            consultar({"moviehash": hash_arquivo})
+        if tmdb_id:
+            consultar({"tmdb_id": tmdb_id, "type": "movie"})
+        if not candidatas and titulo:
+            consultar({"query": titulo, "type": "movie", **({"year": ano} if ano else {})})
+        for c in candidatas:
+            c.idioma = c.idioma or (prefs[0] if prefs else "und")
+
+        def preferencia(c: Candidata) -> int:
+            return prefs.index(c.idioma) if c.idioma in prefs else len(prefs)
+
+        candidatas.sort(key=lambda c: (preferencia(c), *c.ordem))
+        limite = 5 if len(prefs) <= 1 else 3   # com vários idiomas, mostra os melhores de cada um
+        resultado: "list[Candidata]" = []
+        contagem: dict = {}
+        for c in candidatas:
+            contagem[c.idioma] = contagem.get(c.idioma, 0) + 1
+            if contagem[c.idioma] <= limite:
+                resultado.append(c)
+        return resultado
+
+    def baixar(self, file_id: int, destino: Path) -> Optional[int]:
+        """Baixa a legenda para 'destino'. Devolve quantos downloads ainda restam hoje (se a API informar)."""
+        dados = self._json("/download", corpo={"file_id": file_id})
+        link = dados.get("link")
+        if not link:
+            raise ErroRede(str(dados.get("message") or "O OpenSubtitles não devolveu o link de download."))
+        conteudo = self._abrir(urllib.request.Request(link, headers={"User-Agent": USER_AGENT}))
+        if not conteudo.strip():
+            raise ErroRede("A legenda baixada veio vazia.")
+        destino.write_bytes(conteudo)
+        restantes = dados.get("remaining")
+        return restantes if isinstance(restantes, int) else None
+
+
+def achar_ferramenta_sync(preferida: str) -> Optional[str]:
+    """Procura uma ferramenta de sincronização por áudio (alass ou ffsubsync) no PATH."""
+    if preferida == "nenhum":
+        return None
+    nomes = ["alass-cli", "alass", "ffsubsync"] if preferida in ("", "auto") else [preferida]
+    for nome in nomes:
+        caminho = shutil.which(nome)
+        if caminho:
+            return caminho
+    return None
+
+
+def comando_sync(ferramenta: str, video: Path, entrada: Path, saida: Path) -> "list[str]":
+    nome = Path(ferramenta).stem.lower()
+    if "ffsubsync" in nome or nome == "subsync":
+        return [ferramenta, str(video), "-i", str(entrada), "-o", str(saida)]
+    return [ferramenta, str(video), str(entrada), str(saida)]  # alass: referência, entrada, saída
+
+
+def executar_com_relogio(cmd: "list[str]", rotulo: str) -> None:
+    """Roda um processo demorado mostrando o tempo decorrido. Levanta ErroProcessamento se falhar."""
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise ErroProcessamento(f"Não consegui iniciar '{Path(cmd[0]).name}': {e}")
+    cauda: deque = deque(maxlen=8)
+
+    def ler() -> None:
+        for linha in proc.stdout:  # type: ignore[union-attr]
+            if linha.strip():
+                cauda.append(linha.strip())
+
+    leitor = threading.Thread(target=ler, daemon=True)
+    leitor.start()
+    inicio = time.monotonic()
+    try:
+        while proc.poll() is None:
+            relogio = pintar("decorrido " + fmt_tempo(time.monotonic() - inicio), CINZA)
+            sys.stdout.write(f"\r  {rotulo:<14} {relogio}" + ("\033[K" if COR else "   "))
+            sys.stdout.flush()
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        print()
+        raise
+    leitor.join(timeout=2)
+    print()
+    if proc.returncode != 0:
+        raise ErroProcessamento(f"'{Path(cmd[0]).name}' falhou: " + " | ".join(list(cauda)[-3:]))
+
+
+# =============================================================================
 # Sessão (estado compartilhado durante a execução)
 # =============================================================================
 
@@ -624,6 +847,8 @@ class Sessao:
         self.cfg = cfg
         self.pasta = pasta
         self.tmdb: Optional[TMDB] = TMDB(cfg.chave_tmdb) if cfg.chave_tmdb else None
+        self.opensubtitles: Optional[OpenSubtitles] = OpenSubtitles(cfg.chave_opensubtitles) if cfg.chave_opensubtitles else None
+        self.tmdb_id: Optional[int] = None  # filme escolhido no passo da capa (ajuda a achar a legenda certa)
         self.reservados: set = set()
         self._tmp = tempfile.TemporaryDirectory(prefix="xrls_")
         self._contador = 0
@@ -648,6 +873,8 @@ class LegendaExterna:
     origem: Path
     arquivo: Path  # versão em UTF-8 usada no ffmpeg
     idioma: str
+    sincronizar: bool = False  # baixada online e ainda não alinhada ao áudio deste arquivo
+    confirmada: bool = False   # o OpenSubtitles garante que ela confere com este arquivo (hash)
 
 
 @dataclass
@@ -896,6 +1123,7 @@ def escolher_capa(nome: str, sessao: Sessao) -> Optional[Path]:
             if imagem:
                 return imagem
             continue
+        sessao.tmdb_id = valor.get("id")  # type: ignore[union-attr]
         resultado = _menu_posters(sessao, valor, sessao.cfg)  # type: ignore[arg-type]
         if isinstance(resultado, Path):
             return resultado
@@ -944,44 +1172,106 @@ def planejar_legendas_embutidas(midia: Midia) -> "tuple[list[int], list[int]]":
     return extrair, manter
 
 
-def planejar_legendas_externas(fonte: Path, sessao: Sessao) -> "list[LegendaExterna]":
+def buscar_legenda_online(midia: Midia, sessao: Sessao, titulo: str, ano: Optional[int]) -> Optional[LegendaExterna]:
+    """Busca no OpenSubtitles (hash do arquivo, ID do TMDB e nome), deixa escolher e baixa."""
+    api = sessao.opensubtitles
+    if api is None:
+        aviso("Chave do OpenSubtitles não configurada (rode com --setup).")
+        return None
+    idioma = sessao.cfg.idioma_busca
+    print(pintar(f"  Buscando legendas ({idioma}) no OpenSubtitles…", CINZA))
+    try:
+        candidatas = api.buscar(idioma, hash_opensubtitles(midia.caminho), sessao.tmdb_id, titulo, ano)
+    except ErroProcessamento as e:
+        aviso(str(e))
+        return None
+    if not candidatas:
+        aviso("Nenhuma legenda encontrada.")
+        return None
+    for i, c in enumerate(candidatas, 1):
+        nome_idioma = IDIOMAS.get(c.idioma, c.idioma.upper())
+        print(f"  {pintar(f'{i:>3}', CIANO, NEGRITO)}  {pintar(nome_idioma, NEGRITO)}  {pintar(abreviar(c.release, 46), CINZA)}")
+        marcas = [pintar(str(c.downloads) + " downloads", CINZA)]
+        if c.hash_ok:
+            marcas.append(pintar("★ sincronizada com este arquivo", VERDE))
+        if c.confiavel:
+            marcas.append("fonte confiável")
+        if c.surdos:
+            marcas.append("para surdos (SDH)")
+        if c.automatica:
+            marcas.append(pintar("tradução automática", AMARELO))
+        if marcas:
+            print("       " + " · ".join(marcas))
+    dica("Enter = 1 · número · n = nenhuma")
+    while True:
+        r = perguntar("Qual baixar?", "1").lower()
+        if r in {"n", "nenhuma"}:
+            return None
+        if r.isdigit() and 1 <= int(r) <= len(candidatas):
+            break
+    escolhida = candidatas[int(r) - 1]
+    temporario = sessao.arquivo_temp(".srt")
+    try:
+        restantes = api.baixar(escolhida.file_id, temporario)
+    except ErroProcessamento as e:
+        aviso(str(e))
+        return None
+    nome_escolhido = IDIOMAS.get(escolhida.idioma, escolhida.idioma.upper())
+    ok(f"Legenda baixada ({nome_escolhido})" + (f" · {restantes} downloads restantes hoje" if restantes is not None else ""))
+    nome = sanitizar(escolhida.release)[:60] or "legenda_online"
+    return LegendaExterna(Path(nome + ".srt"), garantir_utf8(temporario, sessao), escolhida.idioma,
+                          sincronizar=not escolhida.hash_ok, confirmada=escolhida.hash_ok)
+
+
+def _interpretar_legendas(resposta: str, candidatas: "list[Path]", pasta: Path) -> "tuple[list[Path], bool]":
+    baixo = resposta.lower().strip()
+    if baixo in {"", "nenhuma", "n", "-"}:
+        return [], False
+    caminho = Path(resposta).expanduser()
+    if not caminho.is_absolute():
+        caminho = pasta / caminho
+    if caminho.is_file():
+        return [caminho], False
+    partes = [p for p in re.split(r"[,\s]+", baixo) if p]
+    online = "b" in partes
+    numeros = parse_selecao(",".join(p for p in partes if p != "b"), list(range(1, len(candidatas) + 1)))
+    if numeros is None and not online:
+        aviso("Não entendi; seguindo sem legenda externa.")
+    return [candidatas[n - 1] for n in numeros or []], online
+
+
+def planejar_legendas_externas(midia: Midia, sessao: Sessao, titulo: str = "",
+                               ano: Optional[int] = None) -> "list[LegendaExterna]":
+    fonte = midia.caminho
     candidatas = listar_arquivos(sessao.pasta, EXTENSOES_LEGENDA)
     base = normalizar(fonte.stem)
     candidatas.sort(key=lambda p: not normalizar(p.stem).startswith(base))
     sugeridas = [i for i, p in enumerate(candidatas, 1) if normalizar(p.stem).startswith(base)]
+    ja_tem_pt = any(s.idioma in {"por", "pob"} for s in midia.legendas)
+    buscar_por_padrao = sessao.opensubtitles is not None and sessao.cfg.buscar_legenda_online and not ja_tem_pt
 
     secao("Legendas externas")
-    escolhidas: "list[Path]" = []
     if candidatas:
         for i, p in enumerate(candidatas, 1):
             marca = pintar("  ★ combina com o vídeo", VERDE) if i in sugeridas else ""
             print(f"  {pintar(f'{i:>3}', CIANO, NEGRITO)}  {p.name}{marca}")
-        dica("Número(s) · arraste um arquivo · 'nenhuma'")
-        padrao = ",".join(map(str, sugeridas)) if sugeridas else "nenhuma"
-        r = limpar_aspas(perguntar("Quais embutir?", padrao))
-        if r.lower() not in {"nenhuma", "n", ""}:
-            caminho = Path(r).expanduser()
-            if caminho.is_file():
-                escolhidas = [caminho]
-            else:
-                nums = parse_selecao(r, list(range(1, len(candidatas) + 1))) or []
-                escolhidas = [candidatas[n - 1] for n in nums]
+    dica("Número(s) · arraste um arquivo · 'b' = buscar online · 'nenhuma'")
+    if sugeridas:
+        padrao = ",".join(map(str, sugeridas))
     else:
-        r = limpar_aspas(perguntar("Arraste uma legenda aqui (Enter para pular)"))
-        if r:
-            caminho = Path(r).expanduser()
-            if not caminho.is_absolute():
-                caminho = sessao.pasta / caminho
-            if caminho.is_file():
-                escolhidas = [caminho]
-            else:
-                aviso("Arquivo não encontrado.")
+        padrao = "b" if buscar_por_padrao else "nenhuma"
+    resposta = limpar_aspas(perguntar("Quais embutir?", padrao))
+    escolhidas, online = _interpretar_legendas(resposta, candidatas, sessao.pasta)
 
     externas = []
     for p in escolhidas:
         sugerido = detectar_idioma(p.name, sessao.cfg.idioma_legenda_padrao)
         idioma = normalizar_idioma(perguntar(f"Idioma de '{abreviar(p.name, 40)}'", sugerido))
         externas.append(LegendaExterna(p, garantir_utf8(p, sessao), idioma))
+    if online:
+        baixada = buscar_legenda_online(midia, sessao, titulo, ano)
+        if baixada:
+            externas.append(baixada)
     return externas
 
 
@@ -1012,6 +1302,7 @@ def planejar(fonte: Path, apenas_capa: bool, sessao: Sessao, posicao: int, total
         aviso(f"Já existe '{nome}.mp4'; vou salvar como '{destino.name}'.")
 
     capa = None
+    sessao.tmdb_id = None
     secao("Capa")
     try:
         capa = escolher_capa(nome, sessao)
@@ -1025,9 +1316,70 @@ def planejar(fonte: Path, apenas_capa: bool, sessao: Sessao, posicao: int, total
         manter = [i for i, s in enumerate(midia.legendas) if s.e_texto]
     else:
         extrair, manter = planejar_legendas_embutidas(midia)
-        externas = planejar_legendas_externas(fonte, sessao)
+        titulo_busca, ano_busca = parse_titulo_ano(nome)
+        externas = planejar_legendas_externas(midia, sessao, titulo_busca, ano_busca)
 
     return Job(midia, destino, parse_titulo_ano(nome)[0], extrair, manter, externas, capa)
+
+
+def sincronizar_legenda(leg: LegendaExterna, video: Path, sessao: Sessao) -> bool:
+    """Alinha a legenda ao áudio do vídeo. Se algo falhar, mantém a original (como o script do mpv)."""
+    ferramenta = achar_ferramenta_sync(sessao.cfg.ferramenta_sync)
+    if not ferramenta:
+        aviso("Sem alass/ffsubsync instalado: usando a legenda como veio (pode estar fora de tempo).")
+        return False
+    saida = sessao.arquivo_temp(".srt")
+    try:
+        executar_com_relogio(comando_sync(ferramenta, video, leg.arquivo, saida), "Sincronizando")
+    except ErroProcessamento as e:
+        aviso(f"Falha na sincronização; usando a legenda original. ({e})")
+        return False
+    if saida.exists() and saida.stat().st_size > 0:
+        leg.arquivo = saida
+        ok("Legenda sincronizada com o áudio")
+        return True
+    aviso("A ferramenta não gerou a legenda sincronizada; usando a original.")
+    return False
+
+
+def sincronizar_externas(job: Job, sessao: Sessao) -> None:
+    for leg in job.externas:
+        if leg.sincronizar:
+            sincronizar_legenda(leg, job.midia.caminho, sessao)
+
+
+def modo_legenda(arquivos: "list[Path]", sessao: Sessao) -> None:
+    """Só legenda: baixa, sincroniza e salva ao lado do vídeo (Nome.pob.srt). Não converte nada."""
+    if sessao.opensubtitles is None:
+        aviso("Chave do OpenSubtitles não configurada (rode com --setup).")
+        return
+    for n, fonte in enumerate(arquivos, 1):
+        secao(f"Legenda {n}/{len(arquivos)} — {abreviar(fonte.name, 50)}")
+        titulo, ano = sugerir_titulo_ano(fonte.stem)
+        sessao.tmdb_id = None
+        if sessao.tmdb:
+            try:
+                filmes = sessao.tmdb.buscar_filmes(titulo, ano)
+                if filmes:
+                    sessao.tmdb_id = filmes[0].get("id")
+                    dica(f"Filme identificado: {filmes[0].get('title')} ({(filmes[0].get('release_date') or '')[:4]})")
+            except ErroProcessamento:
+                pass
+        try:
+            midia = Midia(fonte, 0.0, fonte.stat().st_size, "", 0, 0)
+            leg = buscar_legenda_online(midia, sessao, titulo, ano)
+            if not leg:
+                continue
+            if leg.sincronizar:
+                sincronizar_legenda(leg, fonte, sessao)
+            destino = proximo_livre(fonte.with_name(f"{fonte.stem}.{leg.idioma}.srt"))
+            shutil.copyfile(leg.arquivo, destino)
+            ok(f"Legenda salva em {destino}")
+        except KeyboardInterrupt:
+            aviso("Cancelado.")
+            break
+        except OSError as e:
+            erro(f"Não consegui salvar a legenda: {e}")
 
 
 def resumir(jobs: "list[Job]", sessao: Sessao) -> "list[str]":
@@ -1046,7 +1398,11 @@ def resumir(jobs: "list[Job]", sessao: Sessao) -> "list[str]":
         audios = ", ".join("copiar" if a.codec in CODECS_AUDIO_COPIAVEIS else f"{a.codec}→aac" for a in m.audio) or "nenhum"
         print(f"     {pintar('vídeo', CINZA)}   {video}")
         print(f"     {pintar('áudio', CINZA)}   {audios}")
-        legs = [f"{m.legendas[i].idioma} (embutida)" for i in job.manter] + [f"{l.idioma} ({l.origem.name})" for l in job.externas]
+        def rotulo_externa(l: LegendaExterna) -> str:
+            extra = " · confere com o arquivo ✓" if l.confirmada else (" · será sincronizada" if l.sincronizar else "")
+            return f"{l.idioma} ({l.origem.name}{extra})"
+
+        legs = [f"{m.legendas[i].idioma} (embutida)" for i in job.manter] + [rotulo_externa(l) for l in job.externas]
         print(f"     {pintar('legendas', CINZA)} {', '.join(legs) if legs else 'nenhuma'}")
         if job.extrair:
             print(f"     {pintar('extrair', CINZA)}  {len(job.extrair)} arquivo(s) .srt")
@@ -1056,6 +1412,8 @@ def resumir(jobs: "list[Job]", sessao: Sessao) -> "list[str]":
         elif politica != "manter" and m.caminho.parent == sessao.pasta:
             destino_orig = f"pasta '{ARQUIVO_ORIGINAIS}'" if politica == "mover" else "APAGADO"
             print(f"     {pintar('original', CINZA)} {destino_orig}")
+    if any(l.sincronizar for j in jobs for l in j.externas) and not achar_ferramenta_sync(sessao.cfg.ferramenta_sync):
+        avisos.append("Legenda baixada precisa de sincronização, mas não achei alass nem ffsubsync: ela entra como veio.")
     try:
         livre = shutil.disk_usage(sessao.pasta).free
         precisa = sum(j.midia.tamanho for j in jobs)
@@ -1157,6 +1515,7 @@ def executar_job(job: Job, sessao: Sessao) -> Resultado:
     parcial = job.destino.with_name(job.destino.name + ".parte")
     try:
         extrair_legendas(job)
+        sincronizar_externas(job, sessao)
         executar_ffmpeg(montar_comando(job, parcial), job.midia.duracao, "Processando")
         if not parcial.exists() or parcial.stat().st_size == 0:
             raise ErroProcessamento("O FFmpeg não gerou o arquivo de saída.")
@@ -1222,6 +1581,19 @@ def configurar(cfg: Config, primeira_vez: bool) -> None:
         cfg.tmdb_api_key = nova
         print(pintar("  Testando chave…", CINZA))
         ok("Chave válida!") if TMDB(nova).validar() else aviso("Não consegui validar agora (sem internet?). Salvei mesmo assim.")
+
+    atual_os = f"termina em …{cfg.opensubtitles_api_key[-4:]}" if cfg.opensubtitles_api_key else "nenhuma"
+    dica("Legendas online: crie um 'API consumer' (chave gratuita) no site opensubtitles.com.")
+    nova_os = perguntar(f"Chave da API do OpenSubtitles (atual: {atual_os}; Enter mantém)").strip()
+    if nova_os:
+        cfg.opensubtitles_api_key = nova_os
+    if cfg.opensubtitles_api_key:
+        cfg.idioma_busca = perguntar("Idiomas das legendas buscadas, por ordem de preferência (ex: pt-br,en)", cfg.idioma_busca)
+        sync = achar_ferramenta_sync(cfg.ferramenta_sync)
+        if sync:
+            ok(f"Sincronização com o áudio disponível ({Path(sync).stem}).")
+        else:
+            dica("Opcional: instale o alass ou o ffsubsync para alinhar legendas ao áudio automaticamente.")
 
     cfg.pasta_trabalho = perguntar("Pasta de trabalho", cfg.pasta_trabalho)
     print("  Depois de processar, o que fazer com o arquivo original?")
@@ -1305,16 +1677,21 @@ def verificar_dependencias() -> None:
         sys.exit(1)
 
 
-def perguntar_modo() -> bool:
-    """True = só capa/nome; False = fluxo completo."""
+def perguntar_modo() -> str:
+    """Devolve 'completo', 'capa' ou 'legenda'."""
     secao("O que fazer?")
     print("   1 - Completo: converter para MP4 + legendas + capa")
     print("   2 - Só capa e nome (não mexe nas legendas)")
-    return perguntar("Opção", "1") == "2"
+    print("   3 - Só legenda: baixar online, sincronizar e salvar ao lado do vídeo")
+    return {"2": "capa", "3": "legenda"}.get(perguntar("Opção", "1"), "completo")
 
 
-def ciclo(arquivos: "list[Path]", sessao: Sessao) -> None:
-    apenas_capa = perguntar_modo()
+def ciclo(arquivos: "list[Path]", sessao: Sessao, modo: Optional[str] = None) -> None:
+    modo = modo or perguntar_modo()
+    if modo == "legenda":
+        modo_legenda(arquivos, sessao)
+        return
+    apenas_capa = modo == "capa"
     jobs = []
     for n, fonte in enumerate(arquivos, 1):
         job = planejar(fonte, apenas_capa, sessao, n, len(arquivos))
@@ -1339,6 +1716,7 @@ def main(argv: "Optional[list[str]]" = None) -> int:
     ap.add_argument("arquivos", nargs="*", help="vídeos a processar (ou arraste sobre o script)")
     ap.add_argument("--dir", help="pasta de trabalho (sobrepõe a configuração)")
     ap.add_argument("--setup", action="store_true", help="reconfigura chave do TMDB e preferências")
+    ap.add_argument("--legenda", action="store_true", help="só baixa/sincroniza a legenda dos arquivos informados")
     ap.add_argument("--sem-animacao", action="store_true", help="pula a animação de abertura")
     ap.add_argument("--version", action="version", version=f"xrls-archive {VERSAO}")
     args = ap.parse_args(argv)
@@ -1363,7 +1741,7 @@ def main(argv: "Optional[list[str]]" = None) -> int:
                 pendentes = []
                 if not arquivos:
                     break
-                ciclo(arquivos, sessao)
+                ciclo(arquivos, sessao, "legenda" if (args.legenda and da_linha_de_comando) else None)
                 if da_linha_de_comando and not confirmar("Processar mais algum arquivo?", False):
                     break
                 da_linha_de_comando = False
